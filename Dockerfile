@@ -4,7 +4,7 @@ FROM rocker/shiny:latest
 WORKDIR /app/
 
 # Copy the R scripts from the local directory into the Docker image
-COPY app/* ./
+COPY /* ./
 
 # system libraries of general use
 ## install debian packages
@@ -17,22 +17,25 @@ RUN apt-get update -qq && apt-get -y --no-install-recommends install \
     libssh2-1-dev \
     unixodbc-dev \
     libcurl4-openssl-dev \
-    libssl-dev
+    libssl-dev \
+    xdg-utils
 
 ## update system libraries
 RUN apt-get update && \
     apt-get upgrade -y && \
     apt-get clean
 
-RUN install2.r --error \
-    shiny  \
-    bslib  \
-    udpipe  \
-    cleanNLP  \
-    quanteda  \
-    quanteda.textstats  \
-    dplyr \
-    stringr \
+RUN R -e "install.packages(c('shiny', 'bslib', 'udpipe', 'cleanNLP', 'quanteda', 'quanteda.textstats', 'dplyr', 'stringr'), repos='https://cloud.r-project.org/')"
+
+# RUN install2.r --error \
+#    shiny  \
+#    bslib  \
+#    udpipe  \
+#    cleanNLP  \
+#    quanteda  \
+#    quanteda.textstats  \
+#    dplyr \
+#    stringr \
 
 # expose port
 EXPOSE 3838
