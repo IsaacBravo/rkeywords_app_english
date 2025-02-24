@@ -1,7 +1,7 @@
 ---
 # Keyword Generator App
 
-This Shiny application generates keywords based on a user-provided boolean search string and a corpus file. It leverages various R packages such as udpipe, cleanNLP, and quanteda to process the corpus and create new keywords.
+This Shiny application generates keywords based on a user-provided boolean search string and a corpus file. It leverages various R packages such as udpipe, cleanNLP, and quanteda to process the corpus and create new keywords. The app is based on the R package (rKeywords) developed by Sean-Kelly Palick [https://github.com/seankellyhp](https://github.com/seankellyhp/rKeywords).
 
 ### Installation
 1. Clone this repository:
