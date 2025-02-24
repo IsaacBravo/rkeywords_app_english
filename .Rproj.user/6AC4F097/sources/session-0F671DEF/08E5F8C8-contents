@@ -1,0 +1,594 @@
+
+# Clean and Split Corpus
+clean_corpus <- function(seedWords, corpus, minSentenceChar = 3) {
+
+  #' Clean training text corpus (without spacyr)
+  #' @param seedWords Starting search string keywords.
+  #' @param corpus A quanteda-formatted text corpus.
+  #' @param minSentenceChar Minimum number of characters in a sentence.
+  #' @return Sentence-level quanteda corpus.
+
+  print("Cleaning Corpus")
+
+  # Convert corpus to character vector
+  corpus_text <- as.character(corpus)
+
+  # Ensure corpus has names (document IDs)
+  if (is.null(names(corpus_text))) {
+    names(corpus_text) <- paste0("doc_", seq_along(corpus_text))  # Assign generic IDs if missing
+  }
+
+  # Create regex pattern for seed words
+  seedRegex <- tolower(paste(lapply(seedWords, function(x) gsub(" ", "[ -_]", x)), collapse = "|"))
+
+  # Filter corpus using seed words
+  findSeed <- str_detect(corpus_text, regex(seedRegex, ignore_case = TRUE))
+  shortCorp <- corpus_text[findSeed]
+
+  # Ensure shortCorp has names
+  if (length(shortCorp) == 0) {
+    stop("No matching seed words found in corpus.")
+  }
+
+  if (is.null(names(shortCorp))) {
+    names(shortCorp) <- paste0("doc_", seq_along(shortCorp))  # Assign document IDs if missing
+  }
+
+  # Split sentences while keeping punctuation
+  sentence_tokens <- unlist(str_split(shortCorp, "(?<=\\.|!|\\?)\\s+"))
+
+  # Create a data frame ensuring document IDs are properly assigned
+  sentence_tokens <- data.frame(
+    orig_doc = rep(names(shortCorp), lengths(str_split(shortCorp, "(?<=\\.|!|\\?)\\s+"))),
+    sentence = sentence_tokens,
+    stringsAsFactors = FALSE
+  )
+
+  # Filter by sentence length
+  sentence_tokens <- sentence_tokens[str_length(sentence_tokens$sentence) >= minSentenceChar, ]
+
+  # Convert to quanteda corpus
+  sentence_corp <- corpus(sentence_tokens, text_field = "sentence")
+
+  return(sentence_corp)
+}
+
+# Tag NER, POS, Nounphrase
+tag_corpus <- function(tidyCorp) {
+
+  #' Parse and tag corpus with entities and parts of speech using udpipe
+  #' @param tidyCorp corpus returned by clean_corpus
+  #' @param model udpipe model for parsing (e.g., "english-ewt")
+  #' @return parsed and lemmatized text with entity and POS tags
+
+  print("Tagging Corpus")
+
+  cnlp_init_udpipe()
+
+  ud_model <- udpipe_load_model("./english-ewt-ud-2.5-191206.udpipe")  # Load model
+
+  # Ensure tidyCorp is in character format
+  text_data <- as.character(tidyCorp)
+
+  # Apply UDPIPE annotation
+  parsedtxt <- udpipe_annotate(ud_model, x = text_data)
+  parsedtxt <- as.data.frame(parsedtxt)  # Convert to data frame
+
+  # Create Entity List (NER)
+  entityListCons <- parsedtxt %>%
+    filter(!is.na(upos) & upos != "O") %>%  # Filter named entities
+    mutate(token = gsub(" ", "_", token))  # Replace spaces with underscores
+
+  # Create Noun Phrase List (Similar to Nounphrase Consolidation in spacyr)
+  nounListCons <- parsedtxt %>%
+    filter(upos %in% c("NOUN", "PROPN", "ADJ")) %>%  # Extract noun phrases
+    mutate(token = gsub(" ", "_", token))  # Replace spaces with underscores
+
+  # Extract only multi-word noun phrases
+  nounphraseOnly <- nounListCons %>%
+    mutate(hasCon = ifelse(grepl("_", token), 1, 0)) %>%
+    filter(hasCon == 1) %>%
+    select(-hasCon)
+
+  # Combine POS tagging and Entity Recognition results
+  allPOSEntNounphrase <- bind_rows(entityListCons, nounphraseOnly)
+
+  return(allPOSEntNounphrase)
+}
+
+filter_corpus <- function(tagCorp, keepList) {
+
+  #' Filter parts of speech, punctuation, and stopwords from corpus.
+  #' @param tagCorp cleaned and tagged corpus
+  #' @param keepList list of POS types to keep
+  #' @return tokenized and cleaned corpus with POS choices.
+  #'
+  # Load Required Packages
+  require(quanteda.textstats, quietly = TRUE)
+
+  # Replace Token with Lemma
+  parsedTextCl <- tagCorp %>%
+    dplyr::select(-token) %>%
+    dplyr::rename("token" = lemma) %>%
+    dplyr::filter(upos %in% keepList)
+
+  # Ensure token list is structured properly
+  token_list <- split(parsedTextCl$token, parsedTextCl$doc_id)
+
+  # Convert to quanteda tokens
+  clText <- quanteda::tokens(token_list,
+                             remove_punct = TRUE,
+                             remove_symbols = TRUE,
+                             remove_numbers = TRUE,
+                             remove_url = TRUE) %>%
+    quanteda::tokens_remove(quanteda::stopwords("en")) %>%
+    quanteda::tokens_tolower()
+
+  # # Clean Corpus
+  # clText <- parsedTextCl %>%
+  #   quanteda::as.tokens() %>%
+  #   quanteda::tokens(corp_toks,
+  #                    remove_punct = TRUE,
+  #                    remove_symbols = TRUE,
+  #                    remove_numbers = TRUE,
+  #                    remove_url = TRUE,
+  #   ) %>%
+  #   quanteda::tokens_remove(quanteda::stopwords()) %>%
+  #   quanteda::tokens_tolower()
+  #
+  allWords <- unique(unlist(clText))
+
+  return(allWords)
+
+}
+
+get_vocabulary <- function(parsedText, minTermFrequency = 2) {
+
+  #' Get filtered list of unique corpus domain relevant words.
+  #' @param parsedText fully cleaned corpus with tagging and filtering.
+  #' @param minTermFrequency minimum number of times a word appears in a text to be kept.
+  #' @return unique list of words in corpus.
+
+  print("🔹 Step 1: Checking and cleaning entity_type column")
+
+  # Ensure entity_type column exists, otherwise create it
+  if (!"entity_type" %in% colnames(parsedText)) {
+    parsedText$entity_type <- "X"
+  } else {
+    parsedText$entity_type <- ifelse(is.na(parsedText$entity_type) | parsedText$entity_type == "", "X", parsedText$entity_type)
+  }
+
+  print("✅ entity_type column cleaned")
+
+  print("🔹 Step 2: Creating word column from lemma")
+  parsedText$word <- stringr::str_trim(tolower(parsedText$lemma), side = "both")
+
+  print("✅ Word column created")
+
+  ### Parts of Speech Processing
+  print("🔹 Step 3: Processing POS tagging")
+
+  parsedTmp <- parsedText %>%
+    dplyr::group_by(word, entity_type) %>%
+    dplyr::summarise(Count = dplyr::n(), pos = first(upos), .groups = "drop") %>%
+    dplyr::distinct(word, entity_type, Count, pos, .keep_all = TRUE)
+
+  print("✅ POS tagging done")
+
+  print("🔹 Step 4: Computing percentages and filtering words")
+
+  parsedTmp <- parsedTmp %>%
+    dplyr::group_by(word) %>%
+    dplyr::mutate(Percentage = round(Count / sum(Count) * 100, 2)) %>%
+    dplyr::slice_max(order_by = Percentage, n = 1) %>%
+    dplyr::distinct(word, .keep_all = TRUE)
+
+  print("✅ Percentage calculations complete")
+
+  ### Summarizing Counts
+  print("🔹 Step 5: Summarizing word occurrences")
+
+  parsedTmp <- parsedTmp %>%
+    dplyr::group_by(word, entity_type) %>%
+    dplyr::summarise(TotCount = sum(Count), Percentage = first(Percentage), pos = first(pos), .groups = "drop")
+
+  print("✅ Word summarization done")
+
+  print("🔹 Step 6: Filtering words based on minTermFrequency")
+
+  parsedTextFin <- parsedTmp %>%
+    dplyr::filter(TotCount >= minTermFrequency) %>%
+    dplyr::ungroup()
+
+  print("✅ Filtering complete")
+
+  return(parsedTextFin)
+}
+
+# Helper functions
+# L2 Norm
+norm_L2 <- function(x){
+
+  #' L2 normalization
+  #' @param x vector
+  #' @return L2 norm vector
+  #'
+  newNorm <- sqrt(sum(x^2))
+  return(newNorm)
+
+}
+
+clean_vocabulary <- function(wordList) {
+
+  #' Further clean word list using rules.
+  #' @param wordList domain relevant vacabulary.
+  #' @return cleaned vocabulary.
+  #'
+  splitWords <- unique(unlist((stringr::str_split(wordList, pattern = "_"))))
+  splitWords <- splitWords[!splitWords %in% quanteda::stopwords()]
+  splitWords <- splitWords[!splitWords %in% as.character(as.list(1:100))]
+  splitWords <- splitWords[!stringr::str_detect(splitWords, '[[:punct:]]')]
+  return(splitWords)
+
+}
+
+## Embeddings
+
+load_glove = function(filename, corpus, n=5000, minTermFrequency = 2) {
+
+  #' Filter domain relevant vocabulary from pre-trained GloVe embeddings.
+  #' @param filename path to pre-trained GloVe word embedding text file.
+  #' @param corpus cleaned text corpus
+  #' @param n total top words to keep from cleaned text corpus
+  #' @param minTermFrequency minimum occurances of word in training text
+  #' @return list of embeddings relevant to domain vocabulary.
+
+  print("Discovering Keywords")
+
+  # Load Required Packages
+  require(vroom, quietly = TRUE)
+
+  filename = path.expand(filename)
+  if (!file.exists(filename)) stop(paste0("File ", filename, " does not exist"))
+
+  vocabulary <- get_vocabulary(corpus, minTermFrequency = minTermFrequency)  %>%
+    dplyr::arrange(desc(TotCount)) %>%
+    dplyr::slice_head(n=n) %>%
+    dplyr::select(word,
+                  "total_count" = TotCount,
+                  "part_of_speech" = pos,
+                  entity_type)
+
+  vocabSplit <- clean_vocabulary(vocabulary$word)
+  gc()
+
+  gl_model <- vroom::vroom(filename, delim = " ", vroom::locale(encoding = "UTF-8"), quote = "Z",
+                           skip_empty_rows = TRUE, skip = 1) %>% # Add skip = 1 to skip row label
+    dplyr::filter(X1 %in% vocabSplit)
+
+  gc()
+  gl_model <- gl_model %>%
+    dplyr::mutate(across(2:ncol(gl_model), ~ scale(., center = FALSE, scale = norm_L2(.))))
+
+  colnames(gl_model) = c('word',paste('dim',1:(ncol(gl_model)-1),sep = '_'))
+
+  model_results <- list("metadata" = vocabulary, "embeddings" = gl_model)
+
+  return(model_results)
+
+}
+
+multi_word_avg <- function(vocabulary, vectors) {
+
+  #' Average embeddings for multi-part words
+  #' @param vocabulary words
+  #' @param vectors embeddings
+  #' @return average embedding for multi-part words.
+
+  # Split seed words
+  dictionarySplit <- stringr::str_split(vocabulary, pattern = "[- _]")
+  cleanWords <- clean_vocabulary(vocabulary)
+
+  # Keep only seed words
+  wordVec <- vectors$embeddings %>%
+    dplyr::filter(word %in% tolower(as.character((unique(unlist(dictionarySplit))))))
+
+  cleanVec = wordVec[FALSE,]
+
+  for (i in 1:length(dictionarySplit)) {
+
+    wordInd <- tolower(unlist(dictionarySplit[[i]]))
+    wordFull <- paste(wordInd, collapse = "_")
+
+    rawVec <- wordVec %>%
+      dplyr::filter(word %in% wordInd)
+
+    if(nrow(rawVec) > 1) {
+
+      tmpVec <- rawVec[,-1] %>%
+        dplyr::summarise(dplyr::across(.cols = everything(), mean)) %>%
+        dplyr::mutate(word = wordFull) %>%
+        dplyr::relocate(word)
+
+    } else {
+
+      tmpVec <- rawVec[,-1] %>%
+        dplyr::mutate(word = wordFull) %>%
+        dplyr::relocate(word)
+
+    }
+
+    cleanVec <- rbind(cleanVec, tmpVec)
+
+  }
+
+  cleanVec <- dplyr::distinct(cleanVec, dplyr::across(contains("dim_")), .keep_all = TRUE)
+
+}
+
+
+get_centroid <- function(dictionary, vectors) {
+
+  #' Get average embedding for a list of words based on centroid.
+  #' @param dictionary list of domain relevant words
+  #' @param vectors word embeddings
+  #' @return normalized centroids for word vectors
+
+  cleanVec <- multi_word_avg(dictionary, vectors)
+
+  # Average overall seed words
+  centroid <- colMeans(cleanVec[,-1])
+  centroid <- centroid / norm_L2(centroid)
+  return(centroid)
+
+}
+
+#' get_keywords = function(dictionary, vectors) {
+#'
+#'   #' Get word recommendations most similar to starting search string.
+#'   #' @param dictionary list of domain relevant words
+#'   #' @param vectors word embeddings
+#'   #' @return cosine similarity
+#'
+#'   print("Ranking Keywords")
+#'
+#'   # Load Required Packages
+#'   require(tibble, quietly = TRUE)
+#'
+#'   # Get Centroid
+#'   centroid <- get_centroid(dictionary, vectors)
+#'
+#'   # Subset Multi-Word Phrases # This can be done going into the function # saves dictionary
+#'   multiWord <- vectors$metadata$word[stringr::str_detect(vectors$metadata$word, '[-_]')]
+#'
+#'   multWordVec <- multi_word_avg(multiWord, vectors)
+#'
+#'   # Convert to Matrix
+#'   metadata <- vectors$metadata
+#'   vectors <- tibble::column_to_rownames(vectors$embeddings, 'word')
+#'   vectorsExpand <- tibble::column_to_rownames(multWordVec, 'word')
+#'   vectors <- dplyr::bind_rows(vectors, vectorsExpand)  %>%
+#'     distinct(dplyr::across(contains("dim_")), .keep_all = TRUE)
+#'
+#'   vectors <- data.matrix(vectors)
+#'   rm(vectorsExpand)
+#'
+#'   # Multiply Matrices
+#'   similarities <- (vectors %*% centroid)[,1] # Matrix Mult
+#'   similarities <- tibble::tibble(word=names(similarities), similarity=similarities)  %>%
+#'     dplyr::arrange(-similarity) %>%
+#'     dplyr::right_join(metadata, by = 'word')
+#'
+#' }
+
+
+get_keywords = function(dictionary, vectors) {
+
+  print("🔹 Step 1: Ranking Keywords")
+
+  if (!"embeddings" %in% names(vectors) || !"metadata" %in% names(vectors)) {
+    stop("❌ Error: `vectors` does not contain `embeddings` or `metadata`.")
+  }
+
+  # Ensure embeddings and metadata have required columns
+  if (!"word" %in% colnames(vectors$embeddings)) {
+    stop("❌ Error: `vectors$embeddings` does not have a `word` column.")
+  }
+
+  if (!"word" %in% colnames(vectors$metadata)) {
+    stop("❌ Error: `vectors$metadata` does not have a `word` column.")
+  }
+
+  # Get Centroid
+  centroid <- tryCatch({
+    get_centroid(dictionary, vectors)
+  }, error = function(e) {
+    stop(paste0("❌ Error in `get_centroid()`: ", e$message))
+  })
+
+  print("✅ Centroid calculated successfully.")
+
+  # Extract Multi-Word Phrases
+  multiWord <- vectors$metadata$word[stringr::str_detect(vectors$metadata$word, '[-_]')]
+
+  if (length(multiWord) == 0) {
+    print("⚠️ Warning: No multi-word phrases found. Skipping multi-word vector averaging.")
+    multWordVec <- tibble::tibble(word = character(), matrix(nrow = 0, ncol = ncol(vectors$embeddings) - 1))
+  } else {
+    multWordVec <- tryCatch({
+      multi_word_avg(multiWord, vectors)
+    }, error = function(e) {
+      stop(paste0("❌ Error in `multi_word_avg()`: ", e$message))
+    })
+    print("✅ Multi-word phrases processed.")
+  }
+
+  # Convert to Matrix
+  metadata <- vectors$metadata
+
+  vectors_matrix <- tryCatch({
+    vectors_df <- tibble::column_to_rownames(vectors$embeddings, 'word')
+
+    if (nrow(multWordVec) > 0) {
+      vectorsExpand <- tibble::column_to_rownames(multWordVec, 'word')
+      combined_vectors <- dplyr::bind_rows(vectors_df, vectorsExpand) %>%
+        distinct(dplyr::across(contains("dim_")), .keep_all = TRUE)
+    } else {
+      combined_vectors <- vectors_df
+    }
+
+    data.matrix(combined_vectors)
+  }, error = function(e) {
+    stop(paste0("❌ Error in matrix conversion: ", e$message))
+  })
+
+  print("✅ Vector matrix created.")
+
+  # Compute Similarities
+  similarities <- tryCatch({
+    sim_scores <- (vectors_matrix %*% centroid)[, 1]  # Matrix Multiplication
+    tibble::tibble(word = names(sim_scores), similarity = sim_scores) %>%
+      dplyr::arrange(-similarity) %>%
+      dplyr::right_join(metadata, by = 'word')
+  }, error = function(e) {
+    stop(paste0("❌ Error computing similarities: ", e$message))
+  })
+
+  print("✅ Keyword ranking complete.")
+
+  return(similarities)
+}
+
+
+# Helper Functions
+
+export_query <- function(results, type = c("boolean", "regex")) {
+
+  #' Format search query
+  #' @param results list of keywords
+  #' @param type boolean or regex style query
+  #' @return cleaned search query
+
+  if (tolower(type) == "boolean") {
+    query <- paste(gsub("_", " ", results), collapse = "' OR '")
+    query <- paste0("'", query, "'")
+
+  } else if (tolower(type) == "regex") {
+    query <- paste(gsub("_", "[ ]", results), collapse = "|")
+    query <- paste0("'", query, "'")
+
+  }
+
+  print(query)
+  return(query)
+}
+
+create_query <- function(results, n = 25, type = c("boolean", "regex")) {
+
+  #' Export keyword results to formatted query
+  #' @param results list of keywords
+  #' @param n number of keywords in new query
+  #' @param type boolean or regex style query
+  #' @return paste friendly search strings
+
+  results <- dplyr::slice_max(results, n = n, order_by = weighted_similarity)$word
+  query <- export_query(results, type = type)
+  return(query)
+}
+
+
+make_bool <- function(regexQ) {
+
+  #' Convert Regex to Boolean
+  #' @param regexQ Regex style query
+  #' @return Boolean style query
+
+  inclOR <- gsub("\\|", " OR ", tolower(regexQ))
+  inclOR <- gsub("\\[", "", inclOR)
+  inclOR <- gsub("\\]", "", inclOR)
+  inclAND <- gsub("\\)\\(\\?\\:\\.\\+\\)\\(", ") AND (", inclOR)
+  return(inclAND)
+}
+
+convert_bool <- function(string, regexPattern = " or | and | doc |\\*") {
+
+  #' Convert Regex or Boolean query to string
+  #' @param string regex or boolean style query
+  #' @return list of keywords
+
+  temp <- gsub(pattern = regexPattern, replacement = "   ", x = string, ignore.case = TRUE)
+  temp <- strsplit(tolower(temp), split = "   ")
+  temp <- lapply(temp, function(x){x[!x ==""]})
+  temp <- unlist(temp)
+  return(temp)
+}
+
+# Automated 'super' function
+automate_keywords = function(seedWords, corpus, modelPath, minSentenceChar = 3, minTermFrequency = 2, nVectors=5000,
+                             nCandidates = 200, weightSimilarity = 2, keepPOS = c("NOUN", "ADJ", "X", "PROPN", "ENTITY", "nounphrase", "PRON")) {
+
+  #' Automated super function
+  #' @description One function to clean, process, and generate new keywords
+  #' @param seedWords starting seed words
+  #' @param corpus domain relevant training text corpus
+  #' @param modelPath path to pre-trained word2vec embedding text
+
+  #' @return list of keywords
+
+  # Load Required Packages
+  require(dplyr, quietly = TRUE)
+  require(quanteda, quietly = TRUE)
+  require(stringr, quietly = TRUE)
+
+  # Prepare Seed Words
+  seedWords <- tolower(seedWords)
+
+  # Preprocess Training Data
+  tagCorp <- tag_corpus(clean_corpus(seedWords, corpus, minSentenceChar = minSentenceChar))
+
+  # Manage Memory
+  rm(corpus)
+  gc()
+
+  # Filter Vocabulary using POS Tagging
+  wordList <- filter_corpus(tagCorp, keepPOS)
+
+  tagCorpCl <- tagCorp %>%
+    filter(tolower(lemma) %in% wordList)
+
+  # Manage Memory
+  rm(tagCorp)
+  rm(wordList)
+
+  gc()
+
+  # Load Word Embeddings and Discover Keywords
+
+  # Load Word Vectors
+  vectorsGlove <- load_glove(modelPath, tagCorpCl, n=nVectors, minTermFrequency = minTermFrequency)
+  gc()
+
+  # Find words
+  keywords <- get_keywords(seedWords, vectorsGlove) %>%
+    dplyr::arrange(desc(unname(similarity))) %>%
+    dplyr::filter(similarity >= 0) %>%
+    dplyr::mutate(total_countL2 = scale(total_count, center = FALSE, scale = norm_L2(total_count)),
+                  similarityL2 = scale(similarity, center = FALSE, scale = norm_L2(similarity)),
+                  weighted_similarity = (total_countL2 + (weightSimilarity * similarityL2))/2) %>%
+    dplyr::select(-c(total_countL2, similarityL2)) %>%
+    tibble::tibble() %>%
+    dplyr::arrange(desc(weighted_similarity))  %>%
+    dplyr::relocate(weighted_similarity, .after = word) %>%
+    dplyr::slice_max(n=nCandidates, order_by = weighted_similarity)
+
+  attributes(keywords$similarity)$names <- NULL
+  attributes(keywords$weighted_similarity)$dimnames <- NULL
+  attributes(keywords$weighted_similarity) <- NULL
+
+  # Manage Memory
+  rm(vectorsGlove, tagCorpCl)
+  gc()
+
+  return(keywords)
+
+}
